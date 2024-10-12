@@ -24,13 +24,14 @@ var httpClient = &http.Client{
 var fileMutex sync.Mutex
 
 type Config struct {
-	OpenAIAPIKey        string `yaml:"openai_api_key"`
-	ModerationAPIURL    string `yaml:"moderation_api_url"`
-	TargetURL           string `yaml:"target_url"`
-	Port                int    `yaml:"port"`
-	WarningMsg          string `yaml:"warning_msg"`
-	MinCharsModerate    int    `yaml:"min_chars_moderate"`    // 达到多少字符时进行审核,不达到则绕过审核
-	FullContextModerate bool   `yaml:"full_context_moderate"` // 是否对完整上下文进行审核,如果启用，使用全部上下文消息，否则取用户最新一条消息
+	OpenAIAPIKey        string   `yaml:"openai_api_key"`
+	ModerationAPIURL    string   `yaml:"moderation_api_url"`
+	TargetURL           string   `yaml:"target_url"`
+	Port                int      `yaml:"port"`
+	WarningMsg          string   `yaml:"warning_msg"`
+	MinCharsModerate    int      `yaml:"min_chars_moderate"`    // 达到多少字符时进行审核,不达到则绕过审核
+	FullContextModerate bool     `yaml:"full_context_moderate"` // 是否对完整上下文进行审核,如果启用，使用全部上下文消息，否则取用户最新一条消息
+	WhiteListModels     []string `yaml:"white_list_models"`     // 白名单模型,绕过审核
 }
 
 type Message struct {
@@ -194,6 +195,12 @@ func handleFlaggedContent(c *gin.Context, isStream bool, model string) {
 	}
 }
 
+type OpenAIChatReq struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream"`
+}
+
 func handleChatCompletions(c *gin.Context) {
 	slog.Info("收到聊天完成请求")
 
@@ -206,14 +213,19 @@ func handleChatCompletions(c *gin.Context) {
 	}
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
 
-	var chatReq struct {
-		Model    string    `json:"model"`
-		Messages []Message `json:"messages"`
-		Stream   bool      `json:"stream"`
-	}
+	var chatReq OpenAIChatReq
 	if err := json.Unmarshal(body, &chatReq); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// 检查模型是否在白名单中
+	for _, model := range config.WhiteListModels {
+		if model == chatReq.Model {
+			slog.Info("模型在白名单中，绕过审核", "模型", chatReq.Model)
+			proxyRequest(c, body)
+			return
+		}
 	}
 
 	var userContent string
@@ -247,11 +259,11 @@ func handleChatCompletions(c *gin.Context) {
 		}
 	}
 
-	slog.Info("正在转发请求到目标URL")
 	proxyRequest(c, body)
 }
 
 func proxyRequest(c *gin.Context, body []byte) {
+	slog.Info("正在转发请求到目标URL")
 	proxyReq, err := http.NewRequest("POST", config.TargetURL, bytes.NewBuffer(body))
 	if err != nil {
 		slog.Error("创建代理请求错误", "错误信息", err)

@@ -5,3 +5,4 @@ port: 8087
 warning_msg: "请不要聊奇怪的话题 | Error: 对话触发审查器权重,已被拦截和记录"
 min_chars_moderate: 0
 full_context_moderate: true
+white_list_models: ["llama-3.1-8b-instant"]
