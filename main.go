@@ -10,11 +10,18 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+var httpClient = &http.Client{
+	Timeout: 180 * time.Second, // 设定超时时间，防止请求挂起
+}
+
+var fileMutex sync.Mutex
 
 type Config struct {
 	OpenAIAPIKey        string `yaml:"openai_api_key"`
@@ -38,17 +45,19 @@ type ModerationResponse struct {
 }
 
 type OpenAIStyleResponse struct {
-	ID                string `json:"id"`
-	Object            string `json:"object"`
-	Created           int64  `json:"created"`
-	Model             string `json:"model"`
-	SystemFingerprint string `json:"system_fingerprint"`
-	Choices           []struct {
-		Index        int               `json:"index"`
-		Delta        map[string]string `json:"delta"`
-		Logprobs     interface{}       `json:"logprobs"`
-		FinishReason string            `json:"finish_reason"`
-	} `json:"choices"`
+	ID                string   `json:"id"`
+	Object            string   `json:"object"`
+	Created           int64    `json:"created"`
+	Model             string   `json:"model"`
+	SystemFingerprint string   `json:"system_fingerprint"`
+	Choices           []Choice `json:"choices"`
+}
+
+type Choice struct {
+	Index        int               `json:"index"`
+	Delta        map[string]string `json:"delta"`
+	Logprobs     interface{}       `json:"logprobs"`
+	FinishReason string            `json:"finish_reason"`
 }
 
 var config Config
@@ -104,8 +113,7 @@ func moderateContent(content string) (bool, error) {
 		"Authorization": fmt.Sprintf("Bearer %s", config.OpenAIAPIKey),
 	})
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -133,6 +141,8 @@ func setHeaders(req *http.Request, headers map[string]string) {
 
 func logFlaggedContent(content string) {
 	slog.Warn("标记为不合规的内容", "内容", content)
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
 	if err := appendToFile("log.txt", content+"\n"); err != nil {
 		slog.Error("写入日志文件错误", "错误信息", err)
 	}
@@ -158,12 +168,7 @@ func generateOpenAIStyleResponse(warningMessage, model string) OpenAIStyleRespon
 		Created:           time.Now().Unix(),
 		Model:             model,
 		SystemFingerprint: "fp_" + uuid.New().String()[:12],
-		Choices: []struct {
-			Index        int               `json:"index"`
-			Delta        map[string]string `json:"delta"`
-			Logprobs     interface{}       `json:"logprobs"`
-			FinishReason string            `json:"finish_reason"`
-		}{
+		Choices: []Choice{
 			{
 				Index:        0,
 				Delta:        map[string]string{"content": warningMessage},
@@ -216,10 +221,16 @@ func handleChatCompletions(c *gin.Context) {
 		userContent = getUserContent(chatReq.Messages)
 	} else {
 		if len(chatReq.Messages) > 0 {
-			lastMessage := chatReq.Messages[len(chatReq.Messages)-1]
-			if lastMessage.Role == "user" {
-				userContent = lastMessage.Content
+			for i := len(chatReq.Messages) - 1; i >= 0; i-- {
+				if chatReq.Messages[i].Role == "user" {
+					userContent = chatReq.Messages[i].Content
+					break
+				}
 			}
+			//lastMessage := chatReq.Messages[len(chatReq.Messages)-1]
+			//if lastMessage.Role == "user" {
+			//	userContent = lastMessage.Content
+			//}
 		}
 	}
 	if len(userContent) >= config.MinCharsModerate {
@@ -267,9 +278,7 @@ func proxyRequest(c *gin.Context, body []byte) {
 
 func copyHeaders(src, dest http.Header) {
 	for name, values := range src {
-		for _, value := range values {
-			dest.Add(name, value)
-		}
+		dest[name] = values
 	}
 }
 
