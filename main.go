@@ -21,7 +21,7 @@ var httpClient = &http.Client{
 	Timeout: 180 * time.Second, // 设定超时时间，防止请求挂起
 }
 
-var fileMutex sync.Mutex
+var fileMutex sync.RWMutex
 
 type Config struct {
 	OpenAIAPIKey        string   `yaml:"openai_api_key"`
@@ -91,7 +91,7 @@ func initializeLogger() {
 func getUserContent(messages []Message) string {
 	userContents := make([]string, 0, len(messages))
 	for _, msg := range messages {
-		if msg.Role == "user" {
+		if msg.Role == "user" || msg.Role == "system" {
 			userContents = append(userContents, msg.Content)
 		}
 	}
@@ -99,8 +99,13 @@ func getUserContent(messages []Message) string {
 }
 
 func moderateContent(content string) (bool, error) {
-	slog.Info("正在审核内容", "内容", content)
-	jsonData, err := json.Marshal(map[string]string{"input": content})
+	model := "text-moderation-latest"
+	if len(content) < 4096 {
+		model = "omni-moderation-latest"
+	}
+	jsonData, err := json.Marshal(map[string]string{
+		"model": model,
+		"input": content})
 	if err != nil {
 		return false, err
 	}
@@ -130,7 +135,10 @@ func moderateContent(content string) (bool, error) {
 	}
 
 	flagged := len(moderationResp.Results) > 0 && moderationResp.Results[0].Flagged
-	slog.Info("审核结果", "是否标记", flagged)
+	slog.Info("审核结果", "是否标记", flagged, "模型", model)
+	if flagged {
+		slog.Info("审核拦截", "内容", content)
+	}
 	return flagged, nil
 }
 
@@ -219,6 +227,26 @@ func handleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	userContent := getUserContent(chatReq.Messages)
+	// 检查长度是否超过8192字符，如果超过替换model值
+	var replaceModel string
+	if len(userContent) > 10*1024 && len(userContent) < 100*1024 {
+		replaceModel = "glm-4-air"
+	}
+	if len(userContent) > 100*1024 {
+		replaceModel = "glm-4-flash"
+	}
+	if replaceModel != "" {
+		slog.Warn("请求体超过设定字符，替换model值", "新model", replaceModel, "字符数", len(userContent))
+		newBody, err := replaceModelValue(body, replaceModel)
+		if err != nil {
+			slog.Error("替换model值错误", "错误信息", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error replacing model value"})
+			return
+		}
+		body = newBody
+	}
+
 	// 检查模型是否在白名单中
 	for _, model := range config.WhiteListModels {
 		if model == chatReq.Model {
@@ -228,10 +256,7 @@ func handleChatCompletions(c *gin.Context) {
 		}
 	}
 
-	var userContent string
-	if config.FullContextModerate {
-		userContent = getUserContent(chatReq.Messages)
-	} else {
+	if !config.FullContextModerate {
 		if len(chatReq.Messages) > 0 {
 			for i := len(chatReq.Messages) - 1; i >= 0; i-- {
 				if chatReq.Messages[i].Role == "user" {
@@ -246,24 +271,70 @@ func handleChatCompletions(c *gin.Context) {
 		}
 	}
 	if len(userContent) >= config.MinCharsModerate {
-		flagged, err := moderateContent(userContent)
-		if err != nil {
-			slog.Error("审核错误", "错误信息", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Moderation error"})
-			return
+		userContents := splitText(userContent)
+		if len(userContents) > 1 {
+			slog.Info("内容过长，已分割", "分割片数", len(userContents))
 		}
-		if flagged {
-			logFlaggedContent(userContent)
-			handleFlaggedContent(c, chatReq.Stream, chatReq.Model)
-			return
+		for _, userContent := range userContents {
+			flagged, err := moderateContent(userContent)
+			if err != nil {
+				slog.Error("审核错误", "错误信息", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Moderation error"})
+				return
+			}
+			if flagged {
+				logFlaggedContent(userContent)
+				handleFlaggedContent(c, chatReq.Stream, chatReq.Model)
+				return
+			}
 		}
 	}
 
 	proxyRequest(c, body)
 }
 
+// 以48K字符切割一个文本
+func splitText(text string) []string {
+	if len(text) <= 48000 {
+		return []string{text}
+	}
+	var result []string
+	for i := 0; i < len(text); i += 48000 {
+		end := i + 48000
+		if end > len(text) {
+			end = len(text)
+		}
+		result = append(result, text[i:end])
+	}
+	return result
+}
+
+// replaceModelValue 用于替换 JSON 数据中的 model 值 定制功能
+func replaceModelValue(input []byte, newModelValue string) ([]byte, error) {
+	// 使用通用的 map 来解析 JSON
+	var data map[string]interface{}
+	if err := json.Unmarshal(input, &data); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	// 检查并替换 model 值
+	if model, exists := data["model"]; exists {
+		if _, ok := model.(string); ok {
+			data["model"] = newModelValue
+		}
+	}
+
+	output, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("could not encode JSON: %w", err)
+	}
+
+	return output, nil
+}
+
 func proxyRequest(c *gin.Context, body []byte) {
 	slog.Info("正在转发请求到目标URL")
+
 	proxyReq, err := http.NewRequest("POST", config.TargetURL, bytes.NewBuffer(body))
 	if err != nil {
 		slog.Error("创建代理请求错误", "错误信息", err)
@@ -294,6 +365,25 @@ func copyHeaders(src, dest http.Header) {
 	}
 }
 
+// 读取log.txt 解析为网页内容
+func GetBanndedContent(c *gin.Context) {
+	fileMutex.RLock()
+	defer fileMutex.RUnlock()
+	file, err := os.ReadFile("log.txt")
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"error": "读取文件错误"})
+		return
+	}
+	// 将文件内容转换为字符串，并将 '\n' 替换为 '<br>'
+	htmlContent := strings.ReplaceAll(string(file), "\n", "<br>")
+
+	// 将内容嵌入 HTML 中，确保换行符正常显示
+	htmlResponse := fmt.Sprintf("<html><body>%s</body></html>", htmlContent)
+
+	// 返回带有日志内容的 HTML
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(htmlResponse))
+}
+
 func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
@@ -301,6 +391,7 @@ func main() {
 		c.String(http.StatusOK, "Service Running...")
 	})
 	r.POST("/v1/chat/completions", handleChatCompletions)
+	r.GET("/api/getBannedContent", GetBanndedContent)
 	if err := r.Run(fmt.Sprintf(":%d", config.Port)); err != nil {
 		slog.Error("启动服务器失败", "错误信息", err)
 	}
